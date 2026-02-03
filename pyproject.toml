@@ -1,0 +1,6 @@
+[project]
+name = "genshin-map"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = []
+

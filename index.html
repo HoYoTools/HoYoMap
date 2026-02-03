@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Teyvat Map</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #status { position: absolute; top: 10px; left: 10px; color: #7ee787; font-family: monospace; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div id="status">Loading...</div>
+    <script type="importmap">
+    { "imports": { "three": "https://unpkg.com/three@0.157.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.157.0/examples/jsm/" } }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 100000);
+        camera.position.set(0, 15000, 15000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        document.body.appendChild(renderer.domElement);
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+        sun.position.set(1, 2, 1);
+        scene.add(sun);
+
+        const objLoader = new OBJLoader();
+        const texLoader = new THREE.TextureLoader();
+        let loaded = 0, total = 0, textured = 0;
+
+        const updateStatus = () => {
+            document.getElementById('status').innerHTML = `Loaded: ${loaded}/${total} blocks<br>Textured: ${textured}`;
+        };
+
+        fetch('/list_raw_hlod').then(r => r.json()).then(files => {
+            total = files.length;
+            updateStatus();
+            files.forEach(f => {
+                const m = f.match(/Stages_BigWorld_(-?\d+)_(-?\d+)_Constant_HLOD_Lod0\.obj/);
+                if (!m) return;
+                const bx = parseInt(m[1]), bz = parseInt(m[2]);
+                objLoader.load(`/raw_hlod/${f}`, obj => {
+                    const box = new THREE.Box3().setFromObject(obj);
+                    const center = new THREE.Vector3();
+                    box.getCenter(center);
+
+                    obj.traverse(c => {
+                        if (c.isMesh && c.geometry) {
+                            const pos = c.geometry.attributes.position;
+                            const uvs = new Float32Array(pos.count * 2);
+                            c.geometry.computeBoundingBox();
+                            const b = c.geometry.boundingBox;
+                            const w = b.max.x - b.min.x, d = b.max.z - b.min.z;
+                            for (let i = 0; i < pos.count; i++) {
+                                uvs[i*2] = 1 - (pos.getX(i) - b.min.x) / w;
+                                uvs[i*2+1] = (pos.getZ(i) - b.min.z) / d;
+                            }
+                            c.geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                        }
+                    });
+
+                    texLoader.load(`/textures/BigWorldTerrain_${bx}_${bz}.bin_BaseMap.png`,
+                        tex => {
+                            tex.colorSpace = THREE.SRGBColorSpace;
+                            obj.traverse(c => { if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ map: tex, side: THREE.DoubleSide }); });
+                            textured++;
+                            updateStatus();
+                        },
+                        undefined,
+                        () => { obj.traverse(c => { if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color: 0x58d68d, side: THREE.DoubleSide }); }); }
+                    );
+
+                    const tx = -bx;
+                    obj.position.set(tx * 1024 + 512 - center.x, 0, bz * 1024 + 512 - center.z);
+                    scene.add(obj);
+                    loaded++;
+                    updateStatus();
+                });
+            });
+        });
+
+        (function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        })();
+
+        addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+    </script>
+</body>
+</html>
