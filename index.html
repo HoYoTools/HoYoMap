@@ -103,6 +103,7 @@
 
         stats: { hlod: [0,0,0], terrain: [0,0,0], city: [0,0,0], water: 0, activeBlocks: 0 },
         lastLodUpdate: 0,
+        lodUpdateInProgress: false,
     };
 
     // #section scene setup
@@ -726,16 +727,29 @@
     async function updateLods() {
         const now = performance.now();
         if (now - state.lastLodUpdate < LOD_UPDATE_MS) return;
+        if (state.lodUpdateInProgress) return;
+        state.lodUpdateInProgress = true;
         state.lastLodUpdate = now;
 
-        state.stats.activeBlocks = 0;
-        for (const block of state.blocks.values()) {
-            await updateBlock(block);
-            if (block.meshes.length > 0) state.stats.activeBlocks++;
-        }
+        try {
+            state.stats.activeBlocks = 0;
+            
+            // sort by distance
+            const blocks = [...state.blocks.values()];
+            const camPos = camera.position;
+            blocks.sort((a, b) => camPos.distanceToSquared(a.center) - camPos.distanceToSquared(b.center));
 
-        for (const ce of state.cityEntries) await updateCityEntry(ce);
-        updateHud();
+            await Promise.all(blocks.map(async block => {
+                await updateBlock(block);
+                if (block.meshes.length > 0) state.stats.activeBlocks++;
+            }));
+
+            await Promise.all(state.cityEntries.map(ce => updateCityEntry(ce)));
+
+            updateHud();
+        } finally {
+            state.lodUpdateInProgress = false;
+        }
     }
 
     // #section init & animate
