@@ -41,7 +41,7 @@
     import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
     import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-    const IS_PROD = true;
+    const IS_PROD = false;
     const PATH = IS_PROD ? 'https://cdn.flatypus.me/genshin' : 'http://127.0.0.1:8080';
     const GAME_DATA = `${PATH}/game_data`;
     const BASE = PATH;
@@ -318,24 +318,30 @@
         state.meshIds.set(mesh, id);
         state.originals.set(id, { x: pos.x, y: pos.y, z: pos.z });
 
-        const hasReal = Math.abs(pos.x) > 0.01 || Math.abs(pos.y) > 0.01 || Math.abs(pos.z) > 0.01;
-        if (hasReal) {
-            mesh.position.set(pos.x, pos.y, pos.z);
-            state.overrides.delete(id);
-        } else if (state.overrides.has(id)) {
-            const o = state.overrides.get(id);
-            mesh.position.set(o.x, o.y, o.z);
+        let foundOverride = null;
+        for (const [key, value] of state.overrides.entries()) {
+            if (id.includes(key)) {
+                foundOverride = value;
+                break;
+            }
+        }
+        if (foundOverride) {
+            mesh.position.set(foundOverride.x, foundOverride.y, foundOverride.z);
+        } else {
+            const hasReal = Math.abs(pos.x) > 0.01 || Math.abs(pos.y) > 0.01 || Math.abs(pos.z) > 0.01;
+            if (hasReal) mesh.position.set(pos.x, pos.y, pos.z);
         }
     }
 
     async function loadOverrides() {
         try {
-            const resp = await fetch(BASE + '/overrides.json');
+            const resp = await fetch(BASE + '/overrides.json?t=' + Date.now());
             if (!resp.ok) return;
             const data = await resp.json();
             for (const [id, pos] of Object.entries(data)) state.overrides.set(id, pos);
-            console.log(`Loaded ${state.overrides.size} position overrides`);
-        } catch (e) { /* no overrides file */ }
+        } catch (e) { 
+            console.error('Failed to load overrides:', e);
+        }
     }
 
     function exportOverrides() {
@@ -377,13 +383,32 @@
     async function loadBlockMesh(filename, type, bx, bz, localPos, noTexture) {
         if (state.meshCache.has(filename)) {
             const clone = state.meshCache.get(filename).clone();
+            // Reset position before applying override or calculated position
+            clone.position.set(0, 0, 0);
+            
             if (state.debug) {
                 const lod = extractLod(filename);
                 const mat = makeMaterial(type, lod);
                 clone.traverse(c => { if (c.isMesh) c.material = mat; });
             }
+            
+            // Recalculate position (don't use cached position)
+            const box = new THREE.Box3().setFromObject(clone);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            const tx = -bx;
+            
+            let calculatedPos;
+            if (type === 'hlod') {
+                calculatedPos = new THREE.Vector3(tx * BLOCK_SIZE + HALF_BLOCK - center.x, 0, bz * BLOCK_SIZE + HALF_BLOCK - center.z);
+            } else if (localPos) {
+                calculatedPos = new THREE.Vector3(tx * BLOCK_SIZE + localPos.x, localPos.y, bz * BLOCK_SIZE + localPos.z);
+            } else {
+                calculatedPos = new THREE.Vector3(0, 0, 0);
+            }
+            
             const id = meshId(type, bx, bz, filename, localPos);
-            registerMesh(clone, id, clone.position.clone());
+            registerMesh(clone, id, calculatedPos);
             return clone;
         }
 
@@ -759,8 +784,23 @@
         if (WALK_KEYS[e.code]) state.move[WALK_KEYS[e.code]] = false;
     });
 
-    renderer.domElement.addEventListener('click', () => {
-        if (state.walk && !pointerControls.isLocked) pointerControls.lock();
+    function getMeshId(mesh) {
+        // First try to get ID from the mesh itself
+        let current = mesh;
+        while (current) {
+            if (state.meshIds.has(current)) {
+                return state.meshIds.get(current);
+            }
+            current = current.parent;
+        }
+        // Fallback to mesh name
+        return mesh.name || 'unnamed';
+    }
+
+    renderer.domElement.addEventListener('mousedown', (event) => {
+        if (state.walk && !pointerControls.isLocked) {
+            pointerControls.lock();
+        }
     });
 
     addEventListener('resize', () => {
