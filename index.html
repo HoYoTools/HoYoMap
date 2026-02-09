@@ -3,102 +3,800 @@
 <head>
     <title>Teyvat Map</title>
     <style>
-        body { margin: 0; overflow: hidden; background: #000; }
+        body { margin: 0; overflow: hidden; background: #0a0a0f; }
         canvas { display: block; }
-        #status { position: absolute; top: 10px; left: 10px; color: #7ee787; font-family: monospace; font-size: 14px; }
+        #hud {
+            position: absolute; top: 10px; left: 10px;
+            color: #7ee787; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+            background: rgba(0,0,0,0.7); padding: 12px 16px; border-radius: 8px;
+            border: 1px solid #30363d; min-width: 200px;
+            user-select: none;
+        }
+        #hud .l { color: #8b949e; }
+        #hud .v { color: #58a6ff; }
+        #hud .o { color: #f0883e; }
+        #hud .row { padding-left: 12px; }
+        #hud .section { margin-top: 8px; }
+        #hud .toggles { margin-top: 8px; font-size: 11px; color: #666; }
+        #hud .on  { color: #7ee787; }
+        #hud .off { color: #f85149; }
+        #hud .walk-panel {
+            margin-top: 4px; padding: 4px; background: #1a4a1a;
+            border-radius: 3px; font-size: 11px;
+        }
+        #hud .legend { margin-top: 4px; font-size: 10px; }
     </style>
 </head>
 <body>
-    <div id="status">Loading...</div>
+    <div id="hud">Loading manifest...</div>
+
     <script type="importmap">
     { "imports": { "three": "https://unpkg.com/three@0.157.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.157.0/examples/jsm/" } }
     </script>
+
     <script type="module">
-        import * as THREE from 'three';
-        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-        import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+    import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+ 
+    // #section constants
+    const BLOCK_SIZE = 1024;
+    const HALF_BLOCK = 512;
+    const LOD_UPDATE_MS = 500;
 
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x000000);
-        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 100000);
-        camera.position.set(0, 15000, 15000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(innerWidth, innerHeight);
-        document.body.appendChild(renderer.domElement);
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
+    const HLOD_THRESHOLDS = [8000, 15000]; // [Lod0 max, Lod1 max]; beyond = Lod2
+    const TERRAIN_THRESHOLD = 4000;
+    const CITY_SOUTH_OFFSET = BLOCK_SIZE;
 
-        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-        const sun = new THREE.DirectionalLight(0xffffff, 1.0);
-        sun.position.set(1, 2, 1);
-        scene.add(sun);
+    const WALK_BASE_SPEED = 200;
+    const WALK_MIN_MULT = 1;
+    const WALK_MAX_MULT = 200;
+    const WALK_DEFAULT_MULT = 100;
+    const WALK_HEIGHT = 50;
 
-        const objLoader = new OBJLoader();
-        const texLoader = new THREE.TextureLoader();
-        let loaded = 0, total = 0, textured = 0;
+    const DEBUG_COLORS = {
+        hlod_0: 0xff0000,    hlod_1: 0xff6600,    hlod_2: 0xffcc00,
+        terrain_0: 0x00ff00, terrain_1: 0x00ffff,  terrain_2: 0x0066ff,
+        water: 0x0088ff,
+        city_0: 0xff00ff,    city_1: 0xcc00cc,     city_2: 0x990099,
+    };
 
-        const updateStatus = () => {
-            document.getElementById('status').innerHTML = `Loaded: ${loaded}/${total} blocks<br>Textured: ${textured}`;
-        };
+    const REGION_PATTERNS = [
+        [/Mengde/i,                                                          null, true],
+        [/LY|Ly_|LYG|Liyue|GL_|GLYJ|HC_/i,                                 0xE8D4B8],
+        [/DQ|Dq_|HZD|Inazuma/i,                                             0xD4B8D4],
+        [/XM|Xm_|Sumeru|SXT|SXTF|CWL|Nvshen|CWMY|CWDJ|CWXJ|CWZ|40Boss/i,  0xC8E8C8],
+        [/FD|Fd_|FDC|Fontaine|KPM/i,                                        0xB8E8E8],
+        [/NT|Nt_|Ndkl|Natlan|BGC|NXZ|HJC|HSLC|LCGY|ZDL/i,                  0xE8C8B8],
+        [/Enka|LXLZ/i,                                                      0xD4D4E8],
+        [/Chasm|TKDX/i,                                                      0xD4C8B8],
+    ];
+    const DEFAULT_REGION_COLOR = 0xD4D4D4;
 
-        fetch('/list_raw_hlod').then(r => r.json()).then(files => {
-            total = files.length;
-            updateStatus();
-            files.forEach(f => {
-                const m = f.match(/Stages_BigWorld_(-?\d+)_(-?\d+)_Constant_HLOD_Lod0\.obj/);
-                if (!m) return;
-                const bx = parseInt(m[1]), bz = parseInt(m[2]);
-                objLoader.load(`/raw_hlod/${f}`, obj => {
-                    const box = new THREE.Box3().setFromObject(obj);
-                    const center = new THREE.Vector3();
-                    box.getCenter(center);
+    // #section state
+    const state = {
+        manifest: null,
+        blocks: new Map(),
+        cityEntries: [],
+        oceanMesh: null,
 
-                    obj.traverse(c => {
-                        if (c.isMesh && c.geometry) {
-                            const pos = c.geometry.attributes.position;
-                            const uvs = new Float32Array(pos.count * 2);
-                            c.geometry.computeBoundingBox();
-                            const b = c.geometry.boundingBox;
-                            const w = b.max.x - b.min.x, d = b.max.z - b.min.z;
-                            for (let i = 0; i < pos.count; i++) {
-                                uvs[i*2] = 1 - (pos.getX(i) - b.min.x) / w;
-                                uvs[i*2+1] = (pos.getZ(i) - b.min.z) / d;
-                            }
-                            c.geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-                        }
-                    });
+        meshCache: new Map(),
+        textureCache: new Map(),
+        failedUrls: new Set(),
+        loading: new Set(),
 
-                    texLoader.load(`/textures/BigWorldTerrain_${bx}_${bz}.bin_BaseMap.png`,
-                        tex => {
-                            tex.colorSpace = THREE.SRGBColorSpace;
-                            obj.traverse(c => { if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ map: tex, side: THREE.DoubleSide }); });
-                            textured++;
-                            updateStatus();
-                        },
-                        undefined,
-                        () => { obj.traverse(c => { if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color: 0x58d68d, side: THREE.DoubleSide }); }); }
-                    );
+        overrides: new Map(),
+        originals: new Map(),
+        meshIds: new WeakMap(),
 
-                    const tx = -bx;
-                    obj.position.set(tx * 1024 + 512 - center.x, 0, bz * 1024 + 512 - center.z);
-                    scene.add(obj);
-                    loaded++;
-                    updateStatus();
-                });
+        debug: false,
+        show: { hlod: true, terrain: true, water: true, city: true },
+
+        walk: false,
+        walkSpeed: WALK_DEFAULT_MULT,
+        pointerLocked: false,
+        move: { forward: false, backward: false, left: false, right: false, up: false, down: false },
+
+        stats: { hlod: [0,0,0], terrain: [0,0,0], city: [0,0,0], water: 0, activeBlocks: 0 },
+        lastLodUpdate: 0,
+    };
+
+    // #section scene setup
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+    scene.fog = new THREE.Fog(0xadd8e6, 15000, 40000);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 100000);
+    camera.position.set(0, 8000, 8000);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const sun = new THREE.DirectionalLight(0xfff4e6, 1.5);
+    sun.position.set(1, 2, 1);
+    scene.add(sun);
+
+    const orbitControls = new OrbitControls(camera, renderer.domElement);
+    orbitControls.enableDamping = true;
+    orbitControls.dampingFactor = 0.05;
+    orbitControls.maxDistance = 50000;
+    orbitControls.minDistance = 100;
+
+    const pointerControls = new PointerLockControls(camera, document.body);
+    const velocity = new THREE.Vector3();
+    const direction = new THREE.Vector3();
+    let prevTime = performance.now();
+
+    const objLoader = new OBJLoader();
+    const gltfLoader = new GLTFLoader();
+    const texLoader = new THREE.TextureLoader();
+
+    const mondstadtTex = texLoader.load('/textures/Stages_Texture_Area_Mengde_City_HLOD_Combined_Diffuse.png');
+    mondstadtTex.colorSpace = THREE.SRGBColorSpace;
+
+    // #section materials
+
+    function makeMaterial(type, lod, texture) {
+        if (state.debug) {
+            const key = type === 'water' ? 'water' : `${type}_${lod}`;
+            return new THREE.MeshStandardMaterial({
+                color: DEBUG_COLORS[key] || 0x888888,
+                side: THREE.DoubleSide,
+            });
+        }
+        if (type === 'water') {
+            return new THREE.MeshStandardMaterial({
+                color: 0x1a5f7a, side: THREE.DoubleSide,
+                metalness: 0.3, roughness: 0.1,
+                transparent: true, opacity: 0.95, depthWrite: false,
+                polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+            });
+        }
+        if (texture) {
+            return new THREE.MeshStandardMaterial({ map: texture, side: THREE.DoubleSide });
+        }
+        return new THREE.MeshStandardMaterial({ color: 0x3d5a3d, side: THREE.DoubleSide });
+    }
+
+    function makeCityMaterial(name, lod) {
+        if (state.debug) {
+            return new THREE.MeshStandardMaterial({
+                color: DEBUG_COLORS[`city_${lod}`] || 0xff00ff,
+                side: THREE.DoubleSide,
+            });
+        }
+        const region = getRegion(name);
+        if (region.isMondstadt) {
+            return new THREE.MeshStandardMaterial({
+                map: mondstadtTex, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.1,
+            });
+        }
+        return new THREE.MeshStandardMaterial({
+            color: region.color, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.1,
+        });
+    }
+
+    function getRegion(name) {
+        for (const [pattern, color, isMondstadt] of REGION_PATTERNS) {
+            if (pattern.test(name)) return { color, isMondstadt: !!isMondstadt };
+        }
+        return { color: DEFAULT_REGION_COLOR, isMondstadt: false };
+    }
+
+    // #section uv generation
+    function generatePlanarUVs(geometry) {
+        const pos = geometry.attributes.position;
+        const uvs = new Float32Array(pos.count * 2);
+        geometry.computeBoundingBox();
+        const { min, max } = geometry.boundingBox;
+        const w = max.x - min.x || 1;
+        const d = max.z - min.z || 1;
+        for (let i = 0; i < pos.count; i++) {
+            uvs[i * 2]     = 1 - (pos.getX(i) - min.x) / w;
+            uvs[i * 2 + 1] = (pos.getZ(i) - min.z) / d;
+        }
+        geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    }
+
+    function generateTerrainUVs(geometry, localPos) {
+        const pos = geometry.attributes.position;
+        const uvs = new Float32Array(pos.count * 2);
+        for (let i = 0; i < pos.count; i++) {
+            uvs[i * 2]     = 1 - (localPos.x + pos.getX(i)) / BLOCK_SIZE;
+            uvs[i * 2 + 1] = (localPos.z + pos.getZ(i)) / BLOCK_SIZE;
+        }
+        geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    }
+
+    // #section texture loading
+    function loadTexture(bx, bz) {
+        const key = `${bx}_${bz}`;
+        if (state.textureCache.has(key)) return Promise.resolve(state.textureCache.get(key));
+
+        const url = `/textures/BigWorldTerrain_${bx}_${bz}.bin_BaseMap.png`;
+        if (state.failedUrls.has(url)) return Promise.resolve(null);
+
+        return new Promise(resolve => {
+            texLoader.load(url, tex => {
+                tex.colorSpace = THREE.SRGBColorSpace;
+                state.textureCache.set(key, tex);
+                resolve(tex);
+            }, undefined, () => {
+                state.failedUrls.add(url);
+                resolve(null);
             });
         });
+    }
 
-        (function animate() {
-            requestAnimationFrame(animate);
-            controls.update();
-            renderer.render(scene, camera);
-        })();
+    // #section mesh id & position overrides
+    function meshId(type, bx, bz, filename, localPos, entryName) {
+        if (type === 'city')  return `city_${(entryName || 'unknown').replace(/\W/g, '_')}_${filename}`;
+        if (type === 'water') return 'water_ocean';
+        const p = localPos ? `_${localPos.x}_${localPos.y}_${localPos.z}` : '';
+        return `${type}_${bx}_${bz}_${filename}${p}`;
+    }
 
-        addEventListener('resize', () => {
-            camera.aspect = innerWidth / innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(innerWidth, innerHeight);
+    function registerMesh(mesh, id, pos) {
+        state.meshIds.set(mesh, id);
+        state.originals.set(id, { x: pos.x, y: pos.y, z: pos.z });
+
+        const hasReal = Math.abs(pos.x) > 0.01 || Math.abs(pos.y) > 0.01 || Math.abs(pos.z) > 0.01;
+        if (hasReal) {
+            mesh.position.set(pos.x, pos.y, pos.z);
+            state.overrides.delete(id);
+        } else if (state.overrides.has(id)) {
+            const o = state.overrides.get(id);
+            mesh.position.set(o.x, o.y, o.z);
+        }
+    }
+
+    async function loadOverrides() {
+        try {
+            const resp = await fetch('/overrides.json');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            for (const [id, pos] of Object.entries(data)) state.overrides.set(id, pos);
+            console.log(`Loaded ${state.overrides.size} position overrides`);
+        } catch (e) { /* no overrides file */ }
+    }
+
+    function exportOverrides() {
+        const obj = Object.fromEntries(state.overrides);
+        const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+        const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: 'overrides.json' });
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    // #section lod helpers
+    function blockCenter(bx, bz) {
+        return new THREE.Vector3(-bx * BLOCK_SIZE + HALF_BLOCK, 0, bz * BLOCK_SIZE + HALF_BLOCK);
+    }
+
+    function wantedLods(distance) {
+        let hlod;
+        if (distance < HLOD_THRESHOLDS[0])      hlod = 0;
+        else if (distance < HLOD_THRESHOLDS[1])  hlod = 1;
+        else                                      hlod = 2;
+        return { hlod, terrain: distance < TERRAIN_THRESHOLD ? 0 : null };
+    }
+
+    function bestAvailableLod(lodArrays, wanted) {
+        for (let l = wanted; l <= 2; l++) {
+            if (lodArrays[l] && lodArrays[l].length > 0) return l;
+        }
+        return null;
+    }
+
+    function extractLod(filename) {
+        const m = filename.match(/Lod(\d)/);
+        return m ? parseInt(m[1]) : 0;
+    }
+
+    // #section mesh loading
+    async function loadBlockMesh(filename, type, bx, bz, localPos) {
+        if (state.meshCache.has(filename)) {
+            const clone = state.meshCache.get(filename).clone();
+            if (state.debug) {
+                const lod = extractLod(filename);
+                const mat = makeMaterial(type, lod);
+                clone.traverse(c => { if (c.isMesh) c.material = mat; });
+            }
+            const id = meshId(type, bx, bz, filename, localPos);
+            registerMesh(clone, id, clone.position.clone());
+            return clone;
+        }
+
+        if (state.loading.has(filename)) return null;
+        const endpoint = type === 'hlod' ? '/hlod/' : '/terrain/';
+        const url = endpoint + filename;
+        if (state.failedUrls.has(url)) return null;
+
+        state.loading.add(filename);
+
+        return new Promise(resolve => {
+            objLoader.load(url, async obj => {
+                obj.traverse(c => {
+                    if (!c.isMesh || !c.geometry) return;
+                    if (type === 'terrain' && localPos) generateTerrainUVs(c.geometry, localPos);
+                    else generatePlanarUVs(c.geometry);
+                });
+
+                const lod = extractLod(filename);
+                const tex = state.debug ? null : await loadTexture(bx, bz);
+                const mat = makeMaterial(type, lod, tex);
+                obj.traverse(c => { if (c.isMesh) c.material = mat; });
+
+                const box = new THREE.Box3().setFromObject(obj);
+                const center = new THREE.Vector3();
+                box.getCenter(center);
+                const tx = -bx;
+
+                if (type === 'hlod') {
+                    obj.position.set(tx * BLOCK_SIZE + HALF_BLOCK - center.x, 0, bz * BLOCK_SIZE + HALF_BLOCK - center.z);
+                } else if (localPos) {
+                    obj.position.set(tx * BLOCK_SIZE + localPos.x, localPos.y, bz * BLOCK_SIZE + localPos.z);
+                }
+
+                state.meshCache.set(filename, obj);
+                state.loading.delete(filename);
+                state.stats[type][lod]++;
+
+                const clone = obj.clone();
+                const id = meshId(type, bx, bz, filename, localPos);
+                registerMesh(clone, id, clone.position.clone());
+                resolve(clone);
+            }, undefined, () => {
+                state.failedUrls.add(url);
+                state.loading.delete(filename);
+                resolve(null);
+            });
         });
+    }
+
+    async function loadCityMesh(entry, lod) {
+        const filename = entry.lods[lod];
+        if (!filename) return null;
+
+        const cacheKey = `city_${filename}`;
+        if (state.meshCache.has(cacheKey)) {
+            const clone = state.meshCache.get(cacheKey).clone();
+            if (state.debug) {
+                const mat = makeCityMaterial(entry.name, lod);
+                clone.traverse(c => { if (c.isMesh) c.material = mat; });
+            }
+            const id = meshId('city', 0, 0, filename, null, entry.name);
+            registerMesh(clone, id, clone.position.clone());
+            return clone;
+        }
+
+        if (state.loading.has(filename)) return null;
+        const url = '/hlod_all/' + filename;
+        if (state.failedUrls.has(url)) return null;
+
+        state.loading.add(filename);
+
+        return new Promise(resolve => {
+            objLoader.load(url, obj => {
+                const mat = makeCityMaterial(entry.name, lod);
+                obj.traverse(c => { if (c.isMesh) c.material = mat; });
+
+                if (entry.position) {
+                    obj.position.set(-entry.position.x + CITY_SOUTH_OFFSET, entry.position.y, entry.position.z);
+                }
+
+                state.meshCache.set(cacheKey, obj);
+                state.loading.delete(filename);
+
+                const clone = obj.clone();
+                const id = meshId('city', 0, 0, filename, null, entry.name);
+                registerMesh(clone, id, clone.position.clone());
+                resolve(clone);
+            }, undefined, () => {
+                state.failedUrls.add(url);
+                state.loading.delete(filename);
+                resolve(null);
+            });
+        });
+    }
+
+    async function loadOcean() {
+        if (state.oceanMesh || !state.show.water) return;
+        const url = '/ocean.glb';
+        if (state.failedUrls.has(url) || state.loading.has('ocean.glb')) return;
+
+        state.loading.add('ocean.glb');
+        return new Promise(resolve => {
+            gltfLoader.load(url, gltf => {
+                const obj = gltf.scene;
+                const mat = makeMaterial('water', 0);
+                obj.traverse(c => { if (c.isMesh) c.material = mat; });
+                obj.position.set(BLOCK_SIZE, 210, 0);
+
+                const id = meshId('water', 0, 0, 'ocean');
+                registerMesh(obj, id, obj.position.clone());
+
+                scene.add(obj);
+                state.oceanMesh = obj;
+                state.loading.delete('ocean.glb');
+                state.stats.water = 1;
+                resolve(obj);
+            }, undefined, () => {
+                state.failedUrls.add(url);
+                state.loading.delete('ocean.glb');
+                resolve(null);
+            });
+        });
+    }
+
+    // #section block lod management
+    function initBlock(key, bx, bz, manifest) {
+        if (state.blocks.has(key)) return state.blocks.get(key);
+
+        const block = {
+            bx, bz,
+            center: blockCenter(bx, bz),
+            hlod: { 0: [], 1: [], 2: [] },
+            terrain: { 0: [], 1: [], 2: [] },
+            meshes: [],
+            activeHlod: null,
+            activeTerrain: null,
+        };
+
+        for (const type of ['hlod', 'terrain']) {
+            const data = manifest[type] && manifest[type][key];
+            if (!data || !data.lods) continue;
+            for (const [lod, meshes] of Object.entries(data.lods)) {
+                block[type][parseInt(lod)] = meshes;
+            }
+        }
+
+        state.blocks.set(key, block);
+        return block;
+    }
+
+    async function updateBlock(block) {
+        const dist = camera.position.distanceTo(block.center);
+        const want = wantedLods(dist);
+
+        const hlodLod = (want.hlod !== null && state.show.hlod)
+            ? bestAvailableLod(block.hlod, want.hlod) : null;
+        const terrainLod = (want.terrain !== null && state.show.terrain)
+            ? bestAvailableLod(block.terrain, want.terrain) : null;
+
+        const hlodKey = hlodLod !== null ? `hlod_${hlodLod}` : null;
+        const terrainKey = terrainLod !== null ? `terrain_${terrainLod}` : null;
+
+        if (block.activeHlod === hlodKey && block.activeTerrain === terrainKey) return;
+
+        for (const m of block.meshes) scene.remove(m);
+        block.meshes = [];
+
+        const loads = [];
+        if (hlodLod !== null) {
+            for (const data of block.hlod[hlodLod]) {
+                loads.push(loadBlockMesh(data.file, 'hlod', block.bx, block.bz, data.position));
+            }
+        }
+        if (terrainLod !== null) {
+            for (const data of block.terrain[terrainLod]) {
+                loads.push(loadBlockMesh(data.file, 'terrain', block.bx, block.bz, data.position));
+            }
+        }
+
+        const meshes = await Promise.all(loads);
+        for (const m of meshes) {
+            if (!m) continue;
+            scene.add(m);
+            block.meshes.push(m);
+        }
+
+        block.activeHlod = hlodKey;
+        block.activeTerrain = terrainKey;
+    }
+
+    // #section city lod management
+    function initCityEntries(allHlodManifest) {
+        const entries = Object.values(allHlodManifest).flat();
+        const valid = entries.filter(e => e.position && (e.lods['0'] || e.lods['1'] || e.lods['2']));
+
+        for (const entry of valid) {
+            state.cityEntries.push({
+                entry,
+                worldPos: new THREE.Vector3(-entry.position.x + CITY_SOUTH_OFFSET, entry.position.y, entry.position.z),
+                activeLod: null,
+                mesh: null,
+            });
+        }
+        console.log(`City HLOD: ${state.cityEntries.length} entries`);
+    }
+
+    async function updateCityEntry(ce) {
+        if (ce.deleted) return;
+        if (!state.show.city) {
+            if (ce.mesh) { scene.remove(ce.mesh); ce.mesh = null; ce.activeLod = null; }
+            return;
+        }
+
+        const availLod = bestAvailableLod(
+            { 0: ce.entry.lods['0'] ? [1] : [], 1: ce.entry.lods['1'] ? [1] : [], 2: ce.entry.lods['2'] ? [1] : [] },
+            0
+        );
+        if (availLod === null || ce.activeLod === availLod) return;
+
+        if (ce.mesh) {
+            scene.remove(ce.mesh);
+            if (ce.activeLod !== null) state.stats.city[ce.activeLod] = Math.max(0, state.stats.city[ce.activeLod] - 1);
+        }
+
+        const mesh = await loadCityMesh(ce.entry, availLod);
+        if (mesh) {
+            scene.add(mesh);
+            ce.mesh = mesh;
+            ce.activeLod = availLod;
+            state.stats.city[availLod]++;
+        }
+    }
+
+    // #section refresh helpers
+    function clearBlocks() {
+        state.meshCache.clear();
+        state.stats.hlod = [0, 0, 0];
+        state.stats.terrain = [0, 0, 0];
+        for (const block of state.blocks.values()) {
+            for (const m of block.meshes) scene.remove(m);
+            block.meshes = [];
+            block.activeHlod = null;
+            block.activeTerrain = null;
+        }
+    }
+
+    function clearCity() {
+        for (const ce of state.cityEntries) {
+            if (ce.mesh) { scene.remove(ce.mesh); ce.mesh = null; }
+            ce.activeLod = null;
+        }
+        for (const key of [...state.meshCache.keys()]) {
+            if (key.startsWith('city_')) state.meshCache.delete(key);
+        }
+        state.stats.city = [0, 0, 0];
+    }
+
+    async function refreshWater() {
+        if (state.oceanMesh) { scene.remove(state.oceanMesh); state.oceanMesh = null; state.stats.water = 0; }
+        if (state.show.water) await loadOcean();
+    }
+
+    // #section walk mode
+    function toggleWalk() {
+        state.walk = !state.walk;
+        orbitControls.enabled = !state.walk;
+        if (state.walk) {
+            pointerControls.lock();
+            state.walkSpeed = WALK_DEFAULT_MULT;
+        } else {
+            pointerControls.unlock();
+        }
+    }
+
+    function adjustWalkSpeed(increase) {
+        const logMin = Math.log(WALK_MIN_MULT);
+        const logMax = Math.log(WALK_MAX_MULT);
+        const step = (logMax - logMin) * 0.05;
+        const cur = Math.log(state.walkSpeed);
+        state.walkSpeed = Math.exp(Math.max(logMin, Math.min(logMax, cur + (increase ? step : -step))));
+    }
+
+    function updateWalkMovement() {
+        if (!state.walk || !pointerControls.isLocked) return;
+
+        const now = performance.now();
+        const delta = (now - prevTime) / 1000;
+        prevTime = now;
+
+        const speed = WALK_BASE_SPEED * state.walkSpeed;
+        const m = state.move;
+
+        velocity.x -= velocity.x * 10 * delta;
+        velocity.z -= velocity.z * 10 * delta;
+        velocity.y -= velocity.y * 10 * delta;
+
+        direction.set(
+            Number(m.right) - Number(m.left),
+            Number(m.up) - Number(m.down),
+            Number(m.forward) - Number(m.backward),
+        ).normalize();
+
+        if (m.forward || m.backward) velocity.z -= direction.z * speed * delta;
+        if (m.left || m.right)       velocity.x -= direction.x * speed * delta;
+        if (m.up || m.down)          velocity.y += direction.y * speed * delta;
+
+        pointerControls.moveRight(-velocity.x * delta);
+        pointerControls.moveForward(-velocity.z * delta);
+        camera.position.y = Math.max(WALK_HEIGHT, camera.position.y + velocity.y * delta);
+    }
+
+    // #section input
+    const WALK_KEYS = {
+        KeyW: 'forward', KeyS: 'backward', KeyA: 'left', KeyD: 'right',
+        Space: 'up', ShiftLeft: 'down', ShiftRight: 'down',
+    };
+
+    const TOGGLE_HANDLERS = {
+        d() { state.debug = !state.debug; clearBlocks(); refreshWater(); clearCity(); },
+        h() { state.show.hlod = !state.show.hlod; clearBlocks(); },
+        t() { state.show.terrain = !state.show.terrain; clearBlocks(); },
+        w() { state.show.water = !state.show.water; refreshWater(); },
+        c() { state.show.city = !state.show.city; clearCity(); },
+    };
+
+    addEventListener('keydown', e => {
+        if (state.walk) {
+            if (WALK_KEYS[e.code]) state.move[WALK_KEYS[e.code]] = true;
+            if (e.code === 'ArrowUp')   adjustWalkSpeed(true);
+            if (e.code === 'ArrowDown') adjustWalkSpeed(false);
+        } else {
+            const handler = TOGGLE_HANDLERS[e.key.toLowerCase()];
+            if (handler) handler();
+        }
+        if (e.key.toLowerCase() === 'f') toggleWalk();
+        if (e.key === 'Escape' && state.walk) {
+            state.walk = false;
+            orbitControls.enabled = true;
+        }
+    });
+
+    addEventListener('keyup', e => {
+        if (WALK_KEYS[e.code]) state.move[WALK_KEYS[e.code]] = false;
+    });
+
+    renderer.domElement.addEventListener('click', () => {
+        if (state.walk && !pointerControls.isLocked) pointerControls.lock();
+    });
+
+    addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // #section hud
+    const hud = document.getElementById('hud');
+
+    function updateHud() {
+        const { x, y, z } = camera.position;
+        const s = state.stats;
+        const sh = state.show;
+
+        const toggle = (key, label, on) =>
+            `<div>[${key}] ${label}: <span class="${on ? 'on' : 'off'}">${on ? 'ON' : 'OFF'}</span></div>`;
+
+        let html = `
+            <div><span class="l">Camera:</span> <span class="v">${x|0}, ${y|0}, ${z|0}</span></div>
+            <div class="section"><span class="l">HLOD:</span></div>
+            <div class="row"><span class="l">L0:</span> <span class="v">${s.hlod[0]}</span> <span class="l">L1:</span> <span class="v">${s.hlod[1]}</span> <span class="l">L2:</span> <span class="v">${s.hlod[2]}</span></div>
+            <div class="section"><span class="l">Terrain:</span></div>
+            <div class="row"><span class="l">L0:</span> <span class="v">${s.terrain[0]}</span> <span class="l">L1:</span> <span class="v">${s.terrain[1]}</span> <span class="l">L2:</span> <span class="v">${s.terrain[2]}</span></div>
+            <div class="section"><span class="l">City:</span></div>
+            <div class="row"><span class="l">L0:</span> <span class="v">${s.city[0]}</span> <span class="l">L1:</span> <span class="v">${s.city[1]}</span> <span class="l">L2:</span> <span class="v">${s.city[2]}</span></div>
+            <div class="section"><span class="l">Water:</span> <span class="v">${s.water}</span> | <span class="l">Blocks:</span> <span class="v">${s.activeBlocks}</span> | <span class="l">Loading:</span> <span class="o">${state.loading.size}</span></div>
+            <div class="toggles">
+                ${toggle('F', 'Walk', state.walk)}
+                ${toggle('D', 'Debug', state.debug)}
+                ${toggle('H', 'HLOD', sh.hlod)}
+                ${toggle('T', 'Terrain', sh.terrain)}
+                ${toggle('W', 'Water', sh.water)}
+                ${toggle('C', 'City', sh.city)}
+            </div>`;
+
+        if (state.walk) {
+            html += `
+            <div class="walk-panel">
+                <strong>WALK MODE</strong> | Speed: <span class="on">${state.walkSpeed.toFixed(1)}x</span> (${(WALK_BASE_SPEED * state.walkSpeed)|0} u/s)<br>
+                <span class="l">[WASD] Move [Up/Down] Speed [Space/Shift] Fly [ESC] Exit</span>
+                ${pointerControls.isLocked ? '' : '<div style="color:#ffa500">Click to lock mouse</div>'}
+            </div>`;
+        }
+
+        if (state.debug) {
+            html += `<div class="legend">
+                <span style="color:#ff0000">H0</span> <span style="color:#ff6600">H1</span> <span style="color:#ffcc00">H2</span>
+                <span style="color:#00ff00">T0</span> <span style="color:#00ffff">T1</span> <span style="color:#0066ff">T2</span>
+                <span style="color:#ff00ff">C0</span> <span style="color:#cc00cc">C1</span> <span style="color:#990099">C2</span>
+            </div>`;
+        }
+
+        hud.innerHTML = html;
+    }
+
+    // #section lod update loop
+    async function updateLods() {
+        const now = performance.now();
+        if (now - state.lastLodUpdate < LOD_UPDATE_MS) return;
+        state.lastLodUpdate = now;
+
+        state.stats.activeBlocks = 0;
+        for (const block of state.blocks.values()) {
+            await updateBlock(block);
+            if (block.meshes.length > 0) state.stats.activeBlocks++;
+        }
+
+        for (const ce of state.cityEntries) await updateCityEntry(ce);
+        updateHud();
+    }
+
+    // #section init & animate
+    async function init() {
+        texLoader.load('/skybox.png', tex => {
+            const pmrem = new THREE.PMREMGenerator(renderer);
+            const env = pmrem.fromEquirectangular(tex).texture;
+            scene.environment = env;
+            scene.background = env;
+            pmrem.dispose();
+        }, undefined, () => console.log('No skybox available'));
+
+        const [manifestResp, allHlodResp] = await Promise.all([
+            fetch('/manifest'),
+            fetch('/all_hlod_manifest'),
+        ]);
+        state.manifest = await manifestResp.json();
+        const allHlod = await allHlodResp.json();
+
+        hud.textContent = 'Loading overrides...';
+        await loadOverrides();
+
+        hud.textContent = 'Initializing blocks...';
+        const allKeys = new Set([
+            ...Object.keys(state.manifest.hlod || {}),
+            ...Object.keys(state.manifest.terrain || {}),
+        ]);
+        for (const key of allKeys) {
+            const [bx, bz] = key.split('_').map(Number);
+            initBlock(key, bx, bz, state.manifest);
+        }
+
+        // Discover extra HLOD blocks not in manifest
+        const hlodFiles = await fetch('/list_hlod').then(r => r.json());
+        for (const f of hlodFiles) {
+            if (!f.includes('Lod0')) continue;
+            const m = f.match(/Stages_BigWorld_(-?\d+)_(-?\d+)_/);
+            if (!m) continue;
+            const bx = parseInt(m[1]), bz = parseInt(m[2]);
+            const key = `${bx}_${bz}`;
+            if (!state.blocks.has(key)) {
+                const block = initBlock(key, bx, bz, state.manifest);
+                block.hlod[0].push({ file: f, position: { x: 0, y: 0, z: 0 } });
+            }
+        }
+
+        hud.textContent = 'Loading ocean...';
+        await loadOcean();
+
+        hud.textContent = 'Initializing city...';
+        initCityEntries(allHlod);
+
+        hud.textContent = `Ready - ${state.blocks.size} blocks, ${state.cityEntries.length} city entries`;
+        animate();
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        if (state.walk && pointerControls.isLocked) {
+            updateWalkMovement();
+        } else {
+            orbitControls.update();
+        }
+        updateLods();
+        renderer.render(scene, camera);
+    }
+
+    init();
     </script>
 </body>
 </html>
